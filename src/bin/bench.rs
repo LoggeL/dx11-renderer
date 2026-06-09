@@ -21,7 +21,7 @@ struct Stats {
     p99: f64,
 }
 
-fn stats(samples: &mut Vec<f64>) -> Stats {
+fn stats(samples: &mut [f64]) -> Stats {
     samples.sort_by(|a, b| a.total_cmp(b));
     let avg = samples.iter().sum::<f64>() / samples.len().max(1) as f64;
     let p99 = samples
