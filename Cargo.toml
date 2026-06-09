@@ -10,8 +10,13 @@ name = "dx11_renderer"
 name = "playground"
 path = "src/bin/playground.rs"
 
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [dependencies]
 glam = "0.30"
+fontdue = "0.9"
 
 [dependencies.windows]
 version = "0.61"

@@ -22,6 +22,7 @@ pub struct Gfx {
     pub dsv: Option<ID3D11DepthStencilView>,
     pub width: u32,
     pub height: u32,
+    pub adapter_name: String,
     allow_tearing: bool,
 }
 
@@ -69,6 +70,15 @@ impl Gfx {
 
             let dxgi_device: IDXGIDevice = device.cast()?;
             let adapter = dxgi_device.GetAdapter()?;
+            let adapter_name = {
+                let desc = adapter.GetDesc()?;
+                let len = desc
+                    .Description
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(desc.Description.len());
+                String::from_utf16_lossy(&desc.Description[..len])
+            };
             let factory: IDXGIFactory2 = adapter.GetParent()?;
 
             let allow_tearing = factory
@@ -116,6 +126,7 @@ impl Gfx {
                 dsv: None,
                 width,
                 height,
+                adapter_name,
                 allow_tearing,
             };
             gfx.create_targets()?;
@@ -196,7 +207,7 @@ impl Gfx {
             self.ctx.ClearRenderTargetView(rtv, &clear);
             self.ctx.ClearDepthStencilView(
                 self.dsv.as_ref().unwrap(),
-                D3D11_CLEAR_DEPTH.0 as u32,
+                D3D11_CLEAR_DEPTH.0,
                 1.0,
                 0,
             );
@@ -276,6 +287,102 @@ impl Gfx {
             self.ctx.Unmap(buf, 0);
         }
         Ok(())
+    }
+}
+
+const TIMER_SLOTS: usize = 8;
+
+struct TimerSlot {
+    disjoint: ID3D11Query,
+    t0: ID3D11Query,
+    t1: ID3D11Query,
+    issued: bool,
+}
+
+/// GPU frame timer built on timestamp queries. A small ring keeps several
+/// frames in flight so readback never stalls the pipeline; results arrive
+/// `TIMER_SLOTS - 1` frames late.
+pub struct GpuTimer {
+    slots: Vec<TimerSlot>,
+    frame: usize,
+}
+
+impl GpuTimer {
+    pub fn new(device: &ID3D11Device) -> Result<Self> {
+        let make = |query| -> Result<ID3D11Query> {
+            let desc = D3D11_QUERY_DESC {
+                Query: query,
+                MiscFlags: 0,
+            };
+            let mut q = None;
+            unsafe { device.CreateQuery(&desc, Some(&mut q))? };
+            Ok(q.unwrap())
+        };
+        let mut slots = Vec::with_capacity(TIMER_SLOTS);
+        for _ in 0..TIMER_SLOTS {
+            slots.push(TimerSlot {
+                disjoint: make(D3D11_QUERY_TIMESTAMP_DISJOINT)?,
+                t0: make(D3D11_QUERY_TIMESTAMP)?,
+                t1: make(D3D11_QUERY_TIMESTAMP)?,
+                issued: false,
+            });
+        }
+        Ok(Self { slots, frame: 0 })
+    }
+
+    pub fn begin(&mut self, ctx: &ID3D11DeviceContext) {
+        let s = &self.slots[self.frame % TIMER_SLOTS];
+        unsafe {
+            ctx.Begin(&s.disjoint);
+            ctx.End(&s.t0);
+        }
+    }
+
+    /// Closes the current measurement and returns the GPU time (ms) of the
+    /// oldest completed frame, if its results are ready.
+    pub fn end(&mut self, ctx: &ID3D11DeviceContext) -> Option<f64> {
+        let s = &mut self.slots[self.frame % TIMER_SLOTS];
+        unsafe {
+            ctx.End(&s.t1);
+            ctx.End(&s.disjoint);
+        }
+        s.issued = true;
+        self.frame += 1;
+        self.collect(ctx, self.frame % TIMER_SLOTS)
+    }
+
+    fn collect(&mut self, ctx: &ID3D11DeviceContext, idx: usize) -> Option<f64> {
+        let s = &mut self.slots[idx];
+        if !s.issued {
+            return None;
+        }
+        unsafe {
+            // GetData returns Ok for S_FALSE (not ready) without writing the
+            // output, so sentinel values distinguish readiness.
+            let mut dj = D3D11_QUERY_DATA_TIMESTAMP_DISJOINT {
+                Frequency: 0,
+                Disjoint: BOOL(1),
+            };
+            ctx.GetData(
+                &s.disjoint,
+                Some(&mut dj as *mut _ as *mut _),
+                std::mem::size_of::<D3D11_QUERY_DATA_TIMESTAMP_DISJOINT>() as u32,
+                0,
+            )
+            .ok()?;
+            if dj.Frequency == 0 {
+                return None;
+            }
+            let mut t0 = u64::MAX;
+            let mut t1 = u64::MAX;
+            ctx.GetData(&s.t0, Some(&mut t0 as *mut _ as *mut _), 8, 0).ok()?;
+            ctx.GetData(&s.t1, Some(&mut t1 as *mut _ as *mut _), 8, 0).ok()?;
+            s.issued = false;
+            if dj.Disjoint.as_bool() || t0 == u64::MAX || t1 == u64::MAX || t1 < t0 {
+                return None;
+            }
+            Some((t1 - t0) as f64 / dj.Frequency as f64 * 1000.0)
+        }
     }
 }
 
