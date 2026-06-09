@@ -21,26 +21,42 @@ cargo run --release
 cargo run --release --bin bench
 ```
 
-Misst CPU-Frametime und GPU-Zeit (Timestamp-Queries, 8-Frame-Ring ohne Stalls) über
-10k–2M Instanzen, je 40 Warmup- + 300 Messframes. Fenster dabei im Vordergrund lassen,
-sonst drückt DWM-Throttling die p99-Werte.
+Drei Suiten: Instancing (10k–2M Cubes), CPU-Glyph-Rasterization, GPU-Text-Rendering.
+GPU-Zeit über Timestamp-Queries (8-Frame-Ring ohne Stalls), je 40 Warmup-Frames.
+Fenster im Vordergrund lassen, sonst drückt DWM-Throttling die p99-Werte.
 
 Referenz RTX 3090 Ti, 1280x720:
 
 | instances | gpu avg (ms) | fps |
 |----------:|-------------:|----:|
-|   100 000 |          1,3 | ~750 |
-|   500 000 |          2,9 | ~340 |
-| 1 000 000 |          5,4 | ~180 |
-| 2 000 000 |         12,5 |  ~80 |
+|   100 000 |          0,7 | ~780 |
+|   500 000 |          3,0 | ~300 |
+| 1 000 000 |          5,6 | ~170 |
+| 2 000 000 |         11,6 |  ~85 |
+
+| glyph raster | 12 px | 17 px | 32 px | 64 px |
+|---|---:|---:|---:|---:|
+| µs/Glyph (CPU) | 2,3 | 2,4 | 3,3 | 5,4 |
+
+| text gpu | 1k chars | 16k | 64k |
+|---|---:|---:|---:|
+| ms/Frame | 0,16 | 1,6 | 6,0 |
 
 ## Font-Renderer
 
-`src/text.rs`: Consolas (System-TTF) wird beim Start via fontdue in einen 512²-R8-Atlas
-gebacken (ASCII 32–126, Shelf-Packing). `draw_text()` sammelt Quads CPU-seitig,
-`flush()` lädt sie einmal pro Frame per map-discard in einen dynamischen Vertex-Buffer
-und zeichnet alpha-geblendet ohne Depth — Pixel-Koordinaten rein, NDC im VS. Der
-Playground rendert damit sein HUD (FPS, CPU-/GPU-Frametime, Controls).
+Komplett selbst gebaut, keine Dependencies:
+
+- `src/font.rs` — TrueType-Parser (cmap Format 4, loca, glyf inkl. Composites, head/hhea/hmtx)
+  plus Rasterizer: quadratische Outlines werden adaptiv zu Liniensegmenten geflattet, pro
+  Zelle wird signed Coverage akkumuliert und mit einem einzigen linearen Prefix-Sum-Pass
+  aufgelöst — analytisches Anti-Aliasing ohne Supersampling, O(Segmente × Scanlines + Pixel).
+  ~413k Glyphen/s bei 17 px.
+- `src/text.rs` — Consolas wird beim Start in einen 512²-R8-Atlas gebacken (ASCII, Shelf-
+  Packing). `draw_text()` sammelt Quads CPU-seitig, `flush()` lädt sie per map-discard in
+  einen dynamischen Vertex-Buffer und zeichnet alpha-geblendet ohne Depth — Pixel-
+  Koordinaten rein, NDC im VS. Der Playground rendert damit sein HUD.
+
+`cargo test` prüft Parsing + Rasterization gegen das System-Consolas.
 
 ## Playground
 
@@ -63,6 +79,7 @@ Compile-Fehler landen in Konsole + HUD.
 - `src/window.rs` — Win32-Fenster, Message-Pump, Keyboard-Polling, Mouselook
 - `src/gfx.rs` — Device/Swapchain/Targets, Resize, Present, Buffer-Helper, HLSL-Compile (fxc), GPU-Timer
 - `src/scene.rs` — Cube-Mesh, Instanz-Generierung, Pipeline, Draw (geteilt von Playground + Bench)
+- `src/font.rs` — TTF-Parser + Scanline-Rasterizer (dependency-frei)
 - `src/text.rs` — Font-Atlas + Text-Batching
 - `src/camera.rs` — LH-Fly-Cam (glam, 0..1-Depth)
 - `src/bin/playground.rs` — Input, HUD, Loop

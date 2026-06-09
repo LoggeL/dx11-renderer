@@ -16,7 +16,6 @@ path = "src/bin/bench.rs"
 
 [dependencies]
 glam = "0.30"
-fontdue = "0.9"
 
 [dependencies.windows]
 version = "0.61"

@@ -1,8 +1,7 @@
 //! Immediate-mode text renderer: a system TTF (Consolas) is baked into an R8
-//! coverage atlas at startup, draw_text() queues quads into a CPU vec and
-//! flush() uploads them once per frame into a dynamic vertex buffer.
-
-use fontdue::{Font, FontSettings};
+//! coverage atlas at startup via the in-house rasterizer (src/font.rs),
+//! draw_text() queues quads into a CPU vec and flush() uploads them once per
+//! frame into a dynamic vertex buffer.
 use windows::Win32::Graphics::Direct3D::D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{
@@ -17,14 +16,8 @@ const TEXT_SHADER: &str = include_str!("../shaders/text.hlsl");
 const ATLAS_SIZE: usize = 512;
 const FIRST_CHAR: u8 = 32;
 const LAST_CHAR: u8 = 126;
-const MAX_CHARS: usize = 4096;
+pub const MAX_CHARS: usize = 4096;
 const VERTEX_STRIDE: u32 = 32;
-
-const FONT_CANDIDATES: &[&str] = &[
-    "C:\\Windows\\Fonts\\consola.ttf",
-    "C:\\Windows\\Fonts\\cour.ttf",
-    "C:\\Windows\\Fonts\\segoeui.ttf",
-];
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -69,46 +62,40 @@ pub struct TextRenderer {
 
 impl TextRenderer {
     pub fn new(gfx: &Gfx, px: f32) -> Result<Self, String> {
-        let font_data = FONT_CANDIDATES
-            .iter()
-            .find_map(|p| std::fs::read(p).ok())
-            .ok_or("no system font found")?;
-        let font = Font::from_bytes(font_data, FontSettings::default())?;
-        let line = font
-            .horizontal_line_metrics(px)
-            .ok_or("font has no horizontal metrics")?;
+        let font = crate::font::load_system()?;
+        let line = font.line_metrics(px);
 
         // bake ASCII into the atlas, simple shelf packing
         let mut atlas = vec![0u8; ATLAS_SIZE * ATLAS_SIZE];
         let mut glyphs = vec![Glyph::default(); (LAST_CHAR - FIRST_CHAR + 1) as usize];
         let (mut x, mut y, mut row_h) = (1usize, 1usize, 0usize);
         for ch in FIRST_CHAR..=LAST_CHAR {
-            let (m, bitmap) = font.rasterize(ch as char, px);
-            if x + m.width + 1 > ATLAS_SIZE {
+            let g = font.rasterize(ch as char, px);
+            if x + g.width + 1 > ATLAS_SIZE {
                 x = 1;
                 y += row_h + 1;
                 row_h = 0;
             }
-            if y + m.height + 1 > ATLAS_SIZE {
+            if y + g.height + 1 > ATLAS_SIZE {
                 return Err("font atlas overflow".into());
             }
-            for (row, src) in bitmap.chunks_exact(m.width.max(1)).enumerate() {
-                if m.width == 0 {
+            for (row, src) in g.coverage.chunks_exact(g.width.max(1)).enumerate() {
+                if g.width == 0 {
                     break;
                 }
                 let dst = (y + row) * ATLAS_SIZE + x;
-                atlas[dst..dst + m.width].copy_from_slice(src);
+                atlas[dst..dst + g.width].copy_from_slice(src);
             }
             let inv = 1.0 / ATLAS_SIZE as f32;
             glyphs[(ch - FIRST_CHAR) as usize] = Glyph {
                 uv0: [x as f32 * inv, y as f32 * inv],
-                uv1: [(x + m.width) as f32 * inv, (y + m.height) as f32 * inv],
-                size: [m.width as f32, m.height as f32],
-                offset: [m.xmin as f32, -(m.height as f32 + m.ymin as f32)],
-                advance: m.advance_width,
+                uv1: [(x + g.width) as f32 * inv, (y + g.height) as f32 * inv],
+                size: [g.width as f32, g.height as f32],
+                offset: [g.xmin as f32, -(g.height as f32 + g.ymin as f32)],
+                advance: g.advance,
             };
-            x += m.width + 1;
-            row_h = row_h.max(m.height);
+            x += g.width + 1;
+            row_h = row_h.max(g.height);
         }
 
         let err = |e: windows::core::Error| e.to_string();
